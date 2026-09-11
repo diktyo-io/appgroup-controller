@@ -1,0 +1,26 @@
+# Normalize line endings to LF on commit, check out as LF everywhere.
+# This prevents CRLF/LF churn when contributors work on Windows.
+* text=auto eol=lf
+
+# Go source and related text files — always LF
+*.go    text eol=lf
+*.mod   text eol=lf
+*.sum   text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.sh    text eol=lf
+*.txt   text eol=lf
+Makefile text eol=lf
+Dockerfile* text eol=lf
+
+# True binaries — no line-ending conversion
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.gz    binary
+*.tar   binary
+*.zip   binary
