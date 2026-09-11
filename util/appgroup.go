@@ -103,14 +103,17 @@ func GetPodAppGroupSelector(pod *v1.Pod) string {
 	return pod.Labels[v1alpha1.AppGroupSelectorLabel]
 }
 
-// Implementation of Topology Sorting algorithms based on https://github.com/otaviokr/topological-sort
-// KahnSort : receives a tree (AppGroup Service Topology) and returns an array with the pods sorted.
+// KahnSort Implementation of Topology Sorting algorithms based on https://github.com/otaviokr/topological-sort
+// receives a tree (AppGroup Service Topology) and returns an array with the pods sorted.
 func KahnSort(tree map[string][]string) ([]string, error) {
 	var sorted []string
 	inDegree := map[string]int{}
 
+	klog.Info("[Sort] KahnSort running...")
+
 	// Normalize the tree to ensure all nodes are referred in the map.
 	normalizedTree := NormalizeTree(tree)
+	klog.V(6).InfoS("[Sort] Normalize tree", "tree", tree)
 
 	// 1 - Calculate the inDegree of all vertices by going through every edge of the graph
 	// Each child gets inDegree++ during breadth-first run.
@@ -127,6 +130,8 @@ func KahnSort(tree map[string][]string) ([]string, error) {
 			}
 		}
 	}
+
+	klog.V(6).InfoS("[Sort] ", "inDegree", inDegree)
 
 	// 2 - Collect all vertices with inDegree = 0 onto a stack
 	stack := []string{}
@@ -179,8 +184,11 @@ func KahnSort(tree map[string][]string) ([]string, error) {
 // TarjanSort : receives a description of a search tree and returns a sorted array based on the Tarjan Sort algorithm.
 func TarjanSort(tree map[string][]string) ([]string, error) {
 
+	klog.Info("[Sort] TarjanSort running...")
+
 	// Normalize the tree to ensure all nodes are referred in the map.
 	normalizedTree := NormalizeTree(tree)
+	klog.V(6).InfoS("[Sort] Normalize tree", "tree", tree)
 
 	var visitFunc func(string) error
 	auxSorted := make([]string, len(normalizedTree))

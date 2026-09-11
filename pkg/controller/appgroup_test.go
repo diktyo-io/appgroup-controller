@@ -19,6 +19,7 @@ package appgroup
 import (
 	"context"
 	"fmt"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/kubernetes/pkg/controller"
 	"testing"
 	"time"
@@ -43,11 +44,17 @@ func TestAppGroupController_Run(t *testing.T) {
 		v1alpha1.AppGroupWorkload{
 			Workload: v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P1", Selector: "P1", APIVersion: "apps/v1", Namespace: "default"},
 			Dependencies: v1alpha1.DependenciesList{v1alpha1.DependenciesInfo{
-				Workload: v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P2", Selector: "P2", APIVersion: "apps/v1", Namespace: "default"}}}},
+				Workload:       v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P2", Selector: "P2", APIVersion: "apps/v1", Namespace: "default"},
+				MaxNetworkCost: 10,
+				MinBandwidth:   *resource.NewQuantity(10, resource.DecimalSI),
+			}}},
 		v1alpha1.AppGroupWorkload{
 			Workload: v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P2", Selector: "P2", APIVersion: "apps/v1", Namespace: "default"},
 			Dependencies: v1alpha1.DependenciesList{v1alpha1.DependenciesInfo{
-				Workload: v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P3", Selector: "P3", APIVersion: "apps/v1", Namespace: "default"}}}},
+				Workload:       v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P3", Selector: "P3", APIVersion: "apps/v1", Namespace: "default"},
+				MaxNetworkCost: 20,
+				MinBandwidth:   *resource.NewQuantity(20, resource.DecimalSI),
+			}}},
 		v1alpha1.AppGroupWorkload{
 			Workload: v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P3", Selector: "P3", APIVersion: "apps/v1", Namespace: "default"}},
 	}
@@ -66,19 +73,43 @@ func TestAppGroupController_Run(t *testing.T) {
 		v1alpha1.AppGroupWorkload{
 			Workload: v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P1", Selector: "P1", APIVersion: "apps/v1", Namespace: "default"}, // frontend
 			Dependencies: v1alpha1.DependenciesList{
-				v1alpha1.DependenciesInfo{Workload: v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P2", Selector: "P2", APIVersion: "apps/v1", Namespace: "default"}},
-				v1alpha1.DependenciesInfo{Workload: v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P3", Selector: "P3", APIVersion: "apps/v1", Namespace: "default"}},
-				v1alpha1.DependenciesInfo{Workload: v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P4", Selector: "P4", APIVersion: "apps/v1", Namespace: "default"}},
-				v1alpha1.DependenciesInfo{Workload: v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P6", Selector: "P6", APIVersion: "apps/v1", Namespace: "default"}},
-				v1alpha1.DependenciesInfo{Workload: v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P8", Selector: "P8", APIVersion: "apps/v1", Namespace: "default"}},
-				v1alpha1.DependenciesInfo{Workload: v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P9", Selector: "P9", APIVersion: "apps/v1", Namespace: "default"}},
-				v1alpha1.DependenciesInfo{Workload: v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P10", Selector: "P10", APIVersion: "apps/v1", Namespace: "default"}},
+				v1alpha1.DependenciesInfo{
+					Workload:       v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P2", Selector: "P2", APIVersion: "apps/v1", Namespace: "default"},
+					MaxNetworkCost: 2,
+					MinBandwidth:   *resource.NewQuantity(10, resource.DecimalSI),
+				},
+				v1alpha1.DependenciesInfo{Workload: v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P3", Selector: "P3", APIVersion: "apps/v1", Namespace: "default"},
+					MaxNetworkCost: 4,
+					MinBandwidth:   *resource.NewQuantity(50, resource.DecimalSI),
+				},
+				v1alpha1.DependenciesInfo{Workload: v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P4", Selector: "P4", APIVersion: "apps/v1", Namespace: "default"},
+					MaxNetworkCost: 16,
+					MinBandwidth:   *resource.NewQuantity(100, resource.DecimalSI),
+				},
+				v1alpha1.DependenciesInfo{Workload: v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P6", Selector: "P6", APIVersion: "apps/v1", Namespace: "default"},
+					MaxNetworkCost: 8,
+					MinBandwidth:   *resource.NewQuantity(75, resource.DecimalSI),
+				},
+				v1alpha1.DependenciesInfo{Workload: v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P8", Selector: "P8", APIVersion: "apps/v1", Namespace: "default"},
+					MaxNetworkCost: 10,
+					MinBandwidth:   *resource.NewQuantity(20, resource.DecimalSI),
+				},
+				v1alpha1.DependenciesInfo{Workload: v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P9", Selector: "P9", APIVersion: "apps/v1", Namespace: "default"},
+					MaxNetworkCost: 12,
+					MinBandwidth:   *resource.NewQuantity(20, resource.DecimalSI),
+				},
+				v1alpha1.DependenciesInfo{Workload: v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P10", Selector: "P10", APIVersion: "apps/v1", Namespace: "default"},
+					MaxNetworkCost: 18,
+					MinBandwidth:   *resource.NewQuantity(30, resource.DecimalSI)},
 			},
 		},
 		v1alpha1.AppGroupWorkload{
 			Workload: v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P2", Selector: "P2", APIVersion: "apps/v1", Namespace: "default"}, // cartService
 			Dependencies: v1alpha1.DependenciesList{
-				v1alpha1.DependenciesInfo{Workload: v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P11", Selector: "P11", APIVersion: "apps/v1", Namespace: "default"}},
+				v1alpha1.DependenciesInfo{Workload: v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P11", Selector: "P11", APIVersion: "apps/v1", Namespace: "default"},
+					MaxNetworkCost: 6,
+					MinBandwidth:   *resource.NewQuantity(20, resource.DecimalSI),
+				},
 			},
 		},
 		v1alpha1.AppGroupWorkload{
@@ -99,18 +130,39 @@ func TestAppGroupController_Run(t *testing.T) {
 		v1alpha1.AppGroupWorkload{
 			Workload: v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P8", Selector: "P8", APIVersion: "apps/v1", Namespace: "default"}, // checkoutService
 			Dependencies: v1alpha1.DependenciesList{
-				v1alpha1.DependenciesInfo{Workload: v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P2", Selector: "P2", APIVersion: "apps/v1", Namespace: "default"}},
-				v1alpha1.DependenciesInfo{Workload: v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P3", Selector: "P3", APIVersion: "apps/v1", Namespace: "default"}},
-				v1alpha1.DependenciesInfo{Workload: v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P4", Selector: "P4", APIVersion: "apps/v1", Namespace: "default"}},
-				v1alpha1.DependenciesInfo{Workload: v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P5", Selector: "P5", APIVersion: "apps/v1", Namespace: "default"}},
-				v1alpha1.DependenciesInfo{Workload: v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P6", Selector: "P6", APIVersion: "apps/v1", Namespace: "default"}},
-				v1alpha1.DependenciesInfo{Workload: v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P7", Selector: "P7", APIVersion: "apps/v1", Namespace: "default"}},
+				v1alpha1.DependenciesInfo{Workload: v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P2", Selector: "P2", APIVersion: "apps/v1", Namespace: "default"},
+					MaxNetworkCost: 10,
+					MinBandwidth:   *resource.NewQuantity(100, resource.DecimalSI),
+				},
+				v1alpha1.DependenciesInfo{Workload: v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P3", Selector: "P3", APIVersion: "apps/v1", Namespace: "default"},
+					MaxNetworkCost: 20,
+					MinBandwidth:   *resource.NewQuantity(200, resource.DecimalSI),
+				},
+				v1alpha1.DependenciesInfo{Workload: v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P4", Selector: "P4", APIVersion: "apps/v1", Namespace: "default"},
+					MaxNetworkCost: 15,
+					MinBandwidth:   *resource.NewQuantity(240, resource.DecimalSI),
+				},
+				v1alpha1.DependenciesInfo{Workload: v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P5", Selector: "P5", APIVersion: "apps/v1", Namespace: "default"},
+					MaxNetworkCost: 30,
+					MinBandwidth:   *resource.NewQuantity(400, resource.DecimalSI),
+				},
+				v1alpha1.DependenciesInfo{Workload: v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P6", Selector: "P6", APIVersion: "apps/v1", Namespace: "default"},
+					MaxNetworkCost: 35,
+					MinBandwidth:   *resource.NewQuantity(100, resource.DecimalSI),
+				},
+				v1alpha1.DependenciesInfo{Workload: v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P7", Selector: "P7", APIVersion: "apps/v1", Namespace: "default"},
+					MaxNetworkCost: 10,
+					MinBandwidth:   *resource.NewQuantity(10, resource.DecimalSI),
+				},
 			},
 		},
 		v1alpha1.AppGroupWorkload{
 			Workload: v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P9", Selector: "P9", APIVersion: "apps/v1", Namespace: "default"}, // recommendationService
 			Dependencies: v1alpha1.DependenciesList{
-				v1alpha1.DependenciesInfo{Workload: v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P3", Selector: "P3", APIVersion: "apps/v1", Namespace: "default"}},
+				v1alpha1.DependenciesInfo{Workload: v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P3", Selector: "P3", APIVersion: "apps/v1", Namespace: "default"},
+					MaxNetworkCost: 10,
+					MinBandwidth:   *resource.NewQuantity(50, resource.DecimalSI),
+				},
 			}},
 		v1alpha1.AppGroupWorkload{
 			Workload: v1alpha1.AppGroupWorkloadInfo{Kind: "Deployment", Name: "P10", Selector: "P10", APIVersion: "apps/v1", Namespace: "default"}, // adService

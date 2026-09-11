@@ -21,9 +21,10 @@ import (
 	"fmt"
 	"github.com/diktyo-io/appgroup-api/pkg/apis/appgroup/v1alpha1"
 	"github.com/diktyo-io/appgroup-controller/util"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/klog/v2"
+	klog "k8s.io/klog/v2"
 	"reflect"
 	"sort"
 	"time"
@@ -49,6 +50,16 @@ import (
 
 const (
 	timeLimitation = 48 * time.Hour
+
+	// podEventDebounce is the coalescing window applied to pod Add/Update/Delete
+	// events before reconciling an AppGroup.  When N pods bind in a short burst
+	// (the common case for a batch workload) every pod fires an event that would
+	// otherwise trigger an immediate AppGroup status PATCH.  By using
+	// agQueue.AddAfter instead of agQueue.Add, events that arrive within this
+	// window for the same AppGroup key are deduplicated by the workqueue, so the
+	// controller issues O(1) PATCHes per burst window instead of O(N) — directly
+	// reducing the AppGroup-update event volume seen by the scheduler plugins.
+	podEventDebounce = 1 * time.Second
 )
 
 // AppGroupController : a controller that processes App groups using provided Handler interface
@@ -101,14 +112,14 @@ func NewAppGroupController(client kubernetes.Interface,
 func (ctrl *AppGroupController) Run(workers int, stopCh <-chan struct{}) {
 	defer ctrl.agQueue.ShutDown()
 
-	klog.InfoS("Starting App Group controller")
+	klog.InfoS("[Init] Starting App Group controller")
 	defer klog.InfoS("Shutting App Group controller")
 
 	if !cache.WaitForCacheSync(stopCh, ctrl.agListerSynced, ctrl.podListerSynced) {
 		klog.Error("Cannot sync caches")
 		return
 	}
-	klog.InfoS("App Group sync finished")
+	klog.InfoS("[Init] App Group sync finished")
 	for i := 0; i < workers; i++ {
 		go wait.Until(ctrl.worker, time.Second, stopCh)
 	}
@@ -154,33 +165,64 @@ func (ctrl *AppGroupController) agDeleted(obj interface{}) {
 
 // podAdded : reacts to a pod creation
 func (ctrl *AppGroupController) podAdded(obj interface{}) {
-	pod := obj.(*v1.Pod)
+	pod, ok := obj.(*v1.Pod)
+	if !ok {
+		return
+	}
+	ctrl.enqueuePodAppGroup(pod)
+}
+
+// podDeleted : reacts to a pod deletion
+func (ctrl *AppGroupController) podDeleted(obj interface{}) {
+	pod, ok := obj.(*v1.Pod)
+	if !ok {
+		// The watch cache may deliver a tombstone when the controller missed
+		// the original delete event.  Extract the Pod from it before proceeding.
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			runtime.HandleError(fmt.Errorf("couldn't get object from tombstone %+v", obj))
+			return
+		}
+		pod, ok = tombstone.Obj.(*v1.Pod)
+		if !ok {
+			runtime.HandleError(fmt.Errorf("tombstone contained object that is not a Pod %#v", obj))
+			return
+		}
+	}
+	ctrl.enqueuePodAppGroup(pod)
+}
+
+// podUpdated : reacts to a pod update
+func (ctrl *AppGroupController) podUpdated(old, new interface{}) {
+	ctrl.podAdded(new)
+}
+
+// enqueuePodAppGroup resolves the AppGroup that owns pod and schedules a
+// debounced reconciliation via agQueue.AddAfter.  Using AddAfter instead of
+// Add means that N pod-bind events arriving within podEventDebounce for the
+// same AppGroup key are collapsed by the workqueue's own deduplication into a
+// single reconciliation — and therefore a single status PATCH — rather than
+// one PATCH per pod.  AppGroup-level events (agAdded/agUpdated) still use the
+// immediate agQueue.Add path so that structural changes (topology, spec) are
+// never delayed.
+func (ctrl *AppGroupController) enqueuePodAppGroup(pod *v1.Pod) {
 	agName := util.GetPodAppGroupLabel(pod)
 	if len(agName) == 0 {
 		return
 	}
 	ag, err := ctrl.agLister.AppGroups(pod.Namespace).Get(agName)
 	if err != nil {
-		klog.ErrorS(err, "Error while adding pod")
+		klog.ErrorS(err, "Error while looking up AppGroup for pod", "pod", klog.KObj(pod))
 		return
 	}
-	klog.V(5).InfoS("Add App group when pod gets added", "AppGroup", klog.KObj(ag), "pod", klog.KObj(pod))
-	ctrl.agAdded(ag)
-}
-
-// podDeleted : reacts to a pod deletion
-func (ctrl *AppGroupController) podDeleted(obj interface{}) {
-	_, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
+	key, err := cache.MetaNamespaceKeyFunc(ag)
 	if err != nil {
 		runtime.HandleError(err)
 		return
 	}
-	ctrl.podAdded(obj)
-}
-
-// pgUpdated : reacts to a pod update
-func (ctrl *AppGroupController) podUpdated(old, new interface{}) {
-	ctrl.podAdded(new)
+	klog.V(5).InfoS("Enqueue AppGroup for pod event (debounced)",
+		"AppGroup", klog.KObj(ag), "pod", klog.KObj(pod), "delay", podEventDebounce)
+	ctrl.agQueue.AddAfter(key, podEventDebounce)
 }
 
 func (ctrl *AppGroupController) worker() {
@@ -243,6 +285,7 @@ func (ctrl *AppGroupController) syncHandler(key string) error {
 		klog.ErrorS(err, "List pods for App group failed", "AppGroup", klog.KObj(agCopy))
 		return err
 	}
+
 	// Update Status of AppGroup CRD
 	// Running Workloads
 	var numWorkloadsRunning int32 = 0
@@ -256,27 +299,33 @@ func (ctrl *AppGroupController) syncHandler(key string) error {
 	}
 
 	agCopy.Status.RunningWorkloads = numWorkloadsRunning
-	klog.V(5).Info("RunningWorkloads: ", numWorkloadsRunning)
+	klog.Info("[Sync] RunningWorkloads: ", numWorkloadsRunning)
 
 	if agCopy.Status.TopologyCalculationTime.IsZero() {
-		klog.V(5).InfoS("Initial Calculation of Topology order...")
+		klog.InfoS("[Sync] Initial Calculation of Topology order...")
 		agCopy.Status.TopologyOrder, err = calculateTopologyOrder(agCopy, agCopy.Spec.TopologySortingAlgorithm, agCopy.Spec.Workloads, err)
 		if err != nil {
-			klog.InfoS("Error Calculating Topology order, application does not reflect a DAG...", "appGroup", key)
+			klog.InfoS("[Sync] Error Calculating Topology order, application does not reflect a DAG...", "appGroup", key)
 			agCopy.Status.TopologyOrder = defaultTopologyOrder(agCopy.Spec.Workloads)
 		}
 		agCopy.Status.TopologyCalculationTime = metav1.Time{Time: time.Now()}
 
+		klog.InfoS("[Sync] Calculation of AppGroup Statistics...")
+		agCopy.Status.AppGroupStatistics = calculateAppGroupStatistics(agCopy.Status.TopologyOrder)
+
 	} else if time.Now().Sub(ag.Status.TopologyCalculationTime.Time) > 24*time.Hour {
-		klog.InfoS("Recalculation of Topology Order... Every 24 hours...")
+		klog.InfoS("[Sync] Recalculation of Topology Order... Every 24 hours...")
 		agCopy.Status.TopologyOrder, err = calculateTopologyOrder(agCopy, agCopy.Spec.TopologySortingAlgorithm, agCopy.Spec.Workloads, err)
 		if err != nil {
-			klog.InfoS("Error Calculating Topology order, application does not reflect a DAG...", "appGroup", key)
+			klog.InfoS("[Sync] Error Calculating Topology order, application does not reflect a DAG...", "appGroup", key)
 			agCopy.Status.TopologyOrder = defaultTopologyOrder(agCopy.Spec.Workloads)
 		}
 		agCopy.Status.TopologyCalculationTime = metav1.Time{Time: time.Now()}
+
+		klog.InfoS("[Sync] Calculation of AppGroup Statistics...")
+		agCopy.Status.AppGroupStatistics = calculateAppGroupStatistics(agCopy.Status.TopologyOrder)
 	}
-	klog.V(5).Info("ag to patch: ", agCopy)
+	klog.V(5).InfoS("[Sync] ag to patch", "ag", agCopy)
 
 	err = ctrl.patchAppGroup(ag, agCopy)
 	if err == nil {
@@ -306,14 +355,75 @@ func calculateTopologyOrder(agCopy *v1alpha1.AppGroup, algorithm string, workloa
 	var order []string
 	var topologyList v1alpha1.AppGroupTopologyList
 	tree := map[string][]string{}
+	minCostTree := map[string]int64{}
+	avgCostTree := map[string]int64{}
+	maxCostTree := map[string]int64{}
+
+	minBandwidthTree := map[string]resource.Quantity{}
+	avgBandwidthTree := map[string]resource.Quantity{}
+	maxBandwidthTree := map[string]resource.Quantity{}
 
 	for _, w := range workloadList {
-		for _, dependency := range w.Dependencies {
-			tree[w.Workload.Name] = append(tree[w.Workload.Name], dependency.Workload.Name)
+		if w.Dependencies == nil { // no dependencies
+			minCostTree[w.Workload.Name] = 0
+			avgCostTree[w.Workload.Name] = 0
+			maxCostTree[w.Workload.Name] = 0
+
+			minBandwidthTree[w.Workload.Name] = *resource.NewQuantity(0, resource.DecimalSI)
+			avgBandwidthTree[w.Workload.Name] = *resource.NewQuantity(0, resource.DecimalSI)
+			maxBandwidthTree[w.Workload.Name] = *resource.NewQuantity(0, resource.DecimalSI)
+		} else {
+			var sum_c, max_c, min_c, num int64
+
+			min_c = 10000
+			sum_b := *resource.NewQuantity(0, resource.DecimalSI)
+			max_b := *resource.NewQuantity(0, resource.DecimalSI)
+			min_b := *resource.NewQuantity(1000000000, resource.DecimalSI)
+
+			for _, dependency := range w.Dependencies {
+				tree[w.Workload.Name] = append(tree[w.Workload.Name], dependency.Workload.Name)
+
+				num += 1
+				// update maximum
+				if max_c < dependency.MaxNetworkCost {
+					max_c = dependency.MaxNetworkCost
+				}
+				// update minimum
+				if min_c > dependency.MaxNetworkCost {
+					min_c = dependency.MaxNetworkCost
+				}
+				sum_c += dependency.MaxNetworkCost
+
+				// update maximum
+				if max_b.Cmp(dependency.MinBandwidth) == -1 {
+					max_b = dependency.MinBandwidth
+				}
+				// update minimum
+				if min_b.Cmp(dependency.MinBandwidth) == 1 {
+					min_b = dependency.MinBandwidth
+				}
+				sum_b.Add(dependency.MinBandwidth)
+			}
+
+			minCostTree[w.Workload.Name] = min_c
+			avgCostTree[w.Workload.Name] = sum_c / num
+			maxCostTree[w.Workload.Name] = max_c
+
+			minBandwidthTree[w.Workload.Name] = min_b
+			avgBandwidthTree[w.Workload.Name] = *resource.NewQuantity(sum_b.Value()/num, resource.DecimalSI)
+			maxBandwidthTree[w.Workload.Name] = max_b
 		}
 	}
 
-	klog.V(5).Info("Service Dependency Tree: ", tree)
+	klog.Info("[calculateTopologyOrder] Service Dependency Tree: ", tree)
+
+	klog.Info("[calculateTopologyOrder] Min Cost Dependency Tree: ", minCostTree)
+	klog.Info("[calculateTopologyOrder] Avg Cost Dependency Tree: ", avgCostTree)
+	klog.Info("[calculateTopologyOrder] Max Cost Dependency Tree: ", maxCostTree)
+
+	klog.Info("[calculateTopologyOrder] Min Bandwidth Dependency Tree: ", minBandwidthTree)
+	klog.Info("[calculateTopologyOrder] Avg Bandwidth Dependency Tree: ", avgBandwidthTree)
+	klog.Info("[calculateTopologyOrder] Max Bandwidth Dependency Tree: ", maxBandwidthTree)
 
 	// Calculate order based on the specified algorithm
 	type sortImpl func(tree map[string][]string) ([]string, error)
@@ -328,43 +438,53 @@ func calculateTopologyOrder(agCopy *v1alpha1.AppGroup, algorithm string, workloa
 
 	sortAlg, exists := sortingAlgorithms[algorithm]
 	if !exists {
-		klog.V(5).Infof("Sorting algorithm not identified: %v. Defaulting to %v", agCopy.Spec.TopologySortingAlgorithm, v1alpha1.AppGroupKahnSort)
+		klog.Infof("[calculateTopologyOrder] Sorting algorithm not identified: %v. Defaulting to %v", agCopy.Spec.TopologySortingAlgorithm, v1alpha1.AppGroupKahnSort)
 		// Default: consider KahnSort algorithm
 		sortAlg = util.KahnSort
 	} else {
-		klog.V(5).InfoS("Sorting algorithm identified", "algorithm", sortAlg)
+		klog.InfoS("[calculateTopologyOrder] Sorting algorithm identified", "algorithm", algorithm)
 	}
 	// Get TopologyList
 	order, err = sortAlg(tree)
 	if err != nil {
-		klog.ErrorS(err, "Sorting failed", "algorithm", sortAlg, "AppGroup", klog.KObj(agCopy))
+		klog.ErrorS(err, "[calculateTopologyOrder] Sorting failed", "algorithm", sortAlg, "AppGroup", klog.KObj(agCopy))
 		return topologyList, err
 	}
 
 	// Sort workload data by Selector
 	sort.Sort(util.BySelector(agCopy.Spec.Workloads))
 
+	klog.InfoS("[calculateTopologyOrder] Sorting workloads", "order", order)
+
 	for id, workloadName := range order {
 		index := int32(id + 1)
 		// Find workload data by name (Binary Search)
 		w := util.FindWorkloadBySelector(agCopy.Spec.Workloads, workloadName)
 		if w == nil {
-			err := fmt.Errorf("Unable to find workload by name... ")
-			klog.Error(err, "Binary search failed")
+			err := fmt.Errorf("[calculateTopologyOrder] Unable to find workload by name... ")
+			klog.Error(err, "[calculateTopologyOrder] Binary search failed")
 			return topologyList, err
 		}
 
 		topologyList = append(topologyList, v1alpha1.AppGroupTopologyInfo{
 			Workload: *w,
 			Index:    index,
+			WorkloadStatistics: v1alpha1.AppGroupStatistics{
+				MinBandwidth: minBandwidthTree[w.Name],
+				AvgBandwidth: avgBandwidthTree[w.Name],
+				MaxBandwidth: maxBandwidthTree[w.Name],
+				MinCost:      minCostTree[w.Name],
+				AvgCost:      avgCostTree[w.Name],
+				MaxCost:      maxCostTree[w.Name],
+			},
 		})
 	}
 
 	// Sort TopologyList by Selector
-	klog.V(5).Infof("Sort Topology List by Workload.Selector... ")
+	klog.Infof("[calculateTopologyOrder] Sort Topology List by Workload.Selector... ")
 	sort.Sort(util.ByWorkloadSelector(topologyList))
 
-	klog.V(5).Info("topologyList: ", topologyList)
+	klog.InfoS("[calculateTopologyOrder] Sorted list", "topologyList", topologyList)
 	return topologyList, nil
 }
 
@@ -372,17 +492,143 @@ func calculateTopologyOrder(agCopy *v1alpha1.AppGroup, algorithm string, workloa
 func defaultTopologyOrder(workloadList v1alpha1.AppGroupWorkloadList) v1alpha1.AppGroupTopologyList {
 	var topologyList v1alpha1.AppGroupTopologyList
 
+	minCostTree := map[string]int64{}
+	avgCostTree := map[string]int64{}
+	maxCostTree := map[string]int64{}
+
+	minBandwidthTree := map[string]resource.Quantity{}
+	avgBandwidthTree := map[string]resource.Quantity{}
+	maxBandwidthTree := map[string]resource.Quantity{}
+
+	for _, w := range workloadList {
+		if w.Dependencies == nil { // no dependencies
+
+			minCostTree[w.Workload.Name] = 0
+			avgCostTree[w.Workload.Name] = 0
+			maxCostTree[w.Workload.Name] = 0
+
+			minBandwidthTree[w.Workload.Name] = *resource.NewQuantity(0, resource.DecimalSI)
+			avgBandwidthTree[w.Workload.Name] = *resource.NewQuantity(0, resource.DecimalSI)
+			maxBandwidthTree[w.Workload.Name] = *resource.NewQuantity(0, resource.DecimalSI)
+
+		} else {
+			var sum_c, max_c, min_c, num int64
+
+			min_c = 10000
+			sum_b := *resource.NewQuantity(0, resource.DecimalSI)
+			max_b := *resource.NewQuantity(0, resource.DecimalSI)
+			min_b := *resource.NewQuantity(1000000000, resource.DecimalSI)
+
+			for _, dependency := range w.Dependencies {
+				num += 1
+
+				// update maximum
+				if max_c < dependency.MaxNetworkCost {
+					max_c = dependency.MaxNetworkCost
+				}
+				// update minimum
+				if min_c > dependency.MaxNetworkCost {
+					min_c = dependency.MaxNetworkCost
+				}
+				sum_c += dependency.MaxNetworkCost
+
+				// update maximum
+				if max_b.Cmp(dependency.MinBandwidth) == -1 {
+					max_b = dependency.MinBandwidth
+				}
+				// update minimum
+				if min_b.Cmp(dependency.MinBandwidth) == 1 {
+					min_b = dependency.MinBandwidth
+				}
+				sum_b.Add(dependency.MinBandwidth)
+			}
+
+			minCostTree[w.Workload.Name] = min_c
+			avgCostTree[w.Workload.Name] = sum_c / num
+			maxCostTree[w.Workload.Name] = max_c
+
+			minBandwidthTree[w.Workload.Name] = min_b
+			avgBandwidthTree[w.Workload.Name] = *resource.NewQuantity(sum_b.Value()/num, resource.DecimalSI)
+			maxBandwidthTree[w.Workload.Name] = max_b
+		}
+	}
+
+	klog.Info("[calculateTopologyOrder] Min Cost Dependency Tree: ", minCostTree)
+	klog.Info("[calculateTopologyOrder] Avg Cost Dependency Tree: ", avgCostTree)
+	klog.Info("[calculateTopologyOrder] Max Cost Dependency Tree: ", maxCostTree)
+
+	klog.Info("[calculateTopologyOrder] Min Bandwidth Dependency Tree: ", minBandwidthTree)
+	klog.Info("[calculateTopologyOrder] Avg Bandwidth Dependency Tree: ", avgBandwidthTree)
+	klog.Info("[calculateTopologyOrder] Max Bandwidth Dependency Tree: ", maxBandwidthTree)
+
 	for i, w := range workloadList {
 		topologyList = append(topologyList, v1alpha1.AppGroupTopologyInfo{
 			Workload: w.Workload,
 			Index:    int32(i + 1),
+			WorkloadStatistics: v1alpha1.AppGroupStatistics{
+				MinBandwidth: minBandwidthTree[w.Workload.Name],
+				AvgBandwidth: avgBandwidthTree[w.Workload.Name],
+				MaxBandwidth: maxBandwidthTree[w.Workload.Name],
+				MinCost:      minCostTree[w.Workload.Name],
+				AvgCost:      avgCostTree[w.Workload.Name],
+				MaxCost:      maxCostTree[w.Workload.Name],
+			},
 		})
 	}
 
 	// Sort TopologyList by Selector
-	klog.V(5).Infof("Sort Topology List by Workload.Selector... ")
+	klog.Infof("[defaultOrder] Sort Topology List by Workload.Selector... ")
 	sort.Sort(util.ByWorkloadSelector(topologyList))
 
-	klog.V(5).Info("topologyList: ", topologyList)
+	klog.InfoS("[defaultOrder] Sorted list", "topologyList", topologyList)
 	return topologyList
+}
+
+// calculateAppGroupStatistics : calculates the AppGroup Statistics
+func calculateAppGroupStatistics(topOrder v1alpha1.AppGroupTopologyList) v1alpha1.AppGroupStatistics {
+	var appGroupStats v1alpha1.AppGroupStatistics
+
+	var sum_c, max_c, min_c, num int64
+
+	min_c = 10000
+	sum_b := *resource.NewQuantity(0, resource.DecimalSI)
+	max_b := *resource.NewQuantity(0, resource.DecimalSI)
+	min_b := *resource.NewQuantity(1000000000, resource.DecimalSI)
+
+	for _, w := range topOrder {
+		klog.InfoS("[calculateAppGroupStatistics] WorkloadStatistics", "w", w.WorkloadStatistics)
+
+		num += 1
+		// update maximum
+		if max_c < w.WorkloadStatistics.MaxCost {
+			max_c = w.WorkloadStatistics.MaxCost
+		}
+		// update minimum
+		if min_c > w.WorkloadStatistics.MinCost {
+			min_c = w.WorkloadStatistics.MinCost
+		}
+		sum_c += w.WorkloadStatistics.AvgCost
+
+		// update maximum
+		if max_b.Cmp(w.WorkloadStatistics.MaxBandwidth) == -1 {
+			max_b = w.WorkloadStatistics.MaxBandwidth
+		}
+		// update minimum
+		if min_b.Cmp(w.WorkloadStatistics.MinBandwidth) == 1 {
+			min_b = w.WorkloadStatistics.MinBandwidth
+		}
+		sum_b.Add(w.WorkloadStatistics.AvgBandwidth)
+	}
+
+	appGroupStats = v1alpha1.AppGroupStatistics{
+		MinBandwidth: min_b,
+		AvgBandwidth: *resource.NewQuantity(sum_b.Value()/num, resource.DecimalSI),
+		MaxBandwidth: max_b,
+		MinCost:      min_c,
+		AvgCost:      sum_c / num,
+		MaxCost:      max_c,
+	}
+	klog.InfoS("[calculateAppGroupStatistics] ", "AppGroupStats", appGroupStats)
+
+	return appGroupStats
 }
