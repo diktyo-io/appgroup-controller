@@ -588,6 +588,10 @@ func defaultTopologyOrder(workloadList v1alpha1.AppGroupWorkloadList) v1alpha1.A
 func calculateAppGroupStatistics(topOrder v1alpha1.AppGroupTopologyList) v1alpha1.AppGroupStatistics {
 	var appGroupStats v1alpha1.AppGroupStatistics
 
+	if len(topOrder) == 0 {
+		return appGroupStats
+	}
+
 	var sum_c, max_c, min_c, num int64
 
 	min_c = 10000
